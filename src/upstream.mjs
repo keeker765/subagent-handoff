@@ -24,11 +24,63 @@ export function proxyFromEnv(env = process.env) {
   try {
     const url = new URL(raw)
     const port = Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
-    return { host: url.hostname, port }
+    return { host: url.hostname, port, noProxy: parseNoProxy(env) }
   } catch {
     return null
   }
 }
+
+/**
+ * 把 `NO_PROXY` 拆成規則。每條記住主機（或後綴）與可選的埠限制。
+ *
+ * 不遵守它的話，凡是有代理的部署環境，連本地假上游、`127.0.0.1`、
+ * docker 內部服務名都會被送進代理 —— 那些位址本來就不該出去。
+ *
+ * 形式與 curl 一致：`*`（全部繞過）、`host`、`.suffix`、`host:port`。
+ *
+ * @returns {{ all: boolean, rules: Array<{ suffix: boolean, host: string, port: number | null }> }}
+ */
+export function parseNoProxy(env = process.env) {
+  const raw = env.NO_PROXY || env.no_proxy || ''
+  const out = { all: false, rules: [] }
+  for (const piece of raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+    // `*` 是「所有目的地都直連」
+    if (piece === '*') {
+      out.all = true
+      continue
+    }
+    // `host:port`：只在那個埠上繞過
+    const colon = piece.lastIndexOf(':')
+    const hasPort = colon > 0 && /^\d+$/.test(piece.slice(colon + 1))
+    const hostPart = hasPort ? piece.slice(0, colon) : piece
+    const suffix = hostPart.startsWith('.')
+    const host = suffix ? hostPart.slice(1) : hostPart
+    if (!host) continue
+    out.rules.push({ suffix, host, port: hasPort ? Number(piece.slice(colon + 1)) : null })
+  }
+  return out
+}
+
+/**
+ * 這個目的地該不該繞過代理。
+ *
+ * @param {string} host 目標主機名或 IP
+ * @param {number} port 目標埠
+ * @param {{ all: boolean, rules: Array<{ suffix: boolean, host: string, port: number | null }> }} noProxy
+ *   `parseNoProxy` 的回傳值
+ * @returns {boolean}
+ */
+export function bypassProxy(host, port, noProxy) {
+  if (noProxy.all) return true
+  const name = host.toLowerCase()
+  return noProxy.rules.some((rule) => {
+    // 帶埠的規則只管那個埠
+    if (rule.port !== null && rule.port !== port) return false
+    // 後綴規則連子網域一起涵蓋
+    return rule.suffix ? name === rule.host || name.endsWith(`.${rule.host}`) : name === rule.host
+  })
+}
+
 
 /**
  * 連到 `host:port`；設了代理就先對代理發 `CONNECT`，隧道建立後才回報。
@@ -42,12 +94,12 @@ export function proxyFromEnv(env = process.env) {
  * @returns {import('node:net').Socket} 底層 socket，呼叫端可在回報前就 destroy 它
  */
 export function connectVia(port, host, proxy, onReady) {
-  // 沒設代理：原版行為，連上目標就算就緒
-  if (!proxy) {
+  // 沒設代理，或目標在 NO_PROXY 裡：原版行為，直接連
+  if (!proxy || bypassProxy(host, port, proxy.noProxy ?? { all: false, rules: [] })) {
     const socket = net.connect(port, host)
     // 用 once 而不是 on：這兩個只該各觸發一次。排到次輪事件循環才回報，
     // 呼叫端（relayUpgrade）會在回報裡掛上 tls.connect；同步掛的話會在
-    // 本輪 emit 還沒走完時就開始讀 socket，實測會卡住握手。
+    // 本輪 emit 還沒走完時就開始讀 socket。
     socket.once('connect', () => setImmediate(() => onReady(null, socket)))
     socket.once('error', (err) => setImmediate(() => onReady(err, null)))
     return socket

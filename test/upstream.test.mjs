@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
 
-import { connectVia, proxyFromEnv } from '../src/upstream.mjs'
+import { connectVia, proxyFromEnv, parseNoProxy, bypassProxy } from '../src/upstream.mjs'
 
 /**
  * 起一個假的 HTTP 代理：收到 `CONNECT` 就回固定狀態行，並記下請求行。
@@ -47,7 +47,8 @@ function ready(port, host, proxy, ms = 5000) {
 
 test('proxyFromEnv：HTTPS_PROXY 優先於 HTTP_PROXY', () => {
   const got = proxyFromEnv({ HTTPS_PROXY: 'http://a.example:8080', HTTP_PROXY: 'http://b.example:3128' })
-  assert.deepEqual(got, { host: 'a.example', port: 8080 })
+  assert.equal(got.host, 'a.example')
+  assert.equal(got.port, 8080)
 })
 
 test('proxyFromEnv：兩個都沒設時回 null（呼叫端據此直連）', () => {
@@ -128,4 +129,47 @@ test('connectVia：握手完成後呼叫端寫的位元組會原樣到達上游'
   assert.equal(echoed, 'PING')
   socket.destroy()
   await new Promise((resolve) => server.close(resolve))
+})
+
+test('parseNoProxy：拆出主機、後綴與埠限制', () => {
+  const got = parseNoProxy({ NO_PROXY: 'localhost, .internal.example, api.example:8443' })
+  assert.equal(got.all, false)
+  assert.deepEqual(got.rules, [
+    { suffix: false, host: 'localhost', port: null },
+    { suffix: true, host: 'internal.example', port: null },
+    { suffix: false, host: 'api.example', port: 8443 },
+  ])
+})
+
+test('parseNoProxy：`*` 代表全部繞過', () => {
+  assert.equal(parseNoProxy({ NO_PROXY: '*' }).all, true)
+})
+
+test('bypassProxy：主機名完全比對才命中', () => {
+  const np = parseNoProxy({ NO_PROXY: 'localhost' })
+  assert.equal(bypassProxy('localhost', 443, np), true)
+  assert.equal(bypassProxy('notlocalhost', 443, np), false)
+})
+
+test('bypassProxy：後綴規則連子網域一起涵蓋', () => {
+  const np = parseNoProxy({ NO_PROXY: '.internal.example' })
+  assert.equal(bypassProxy('internal.example', 443, np), true)
+  assert.equal(bypassProxy('svc.internal.example', 443, np), true)
+  assert.equal(bypassProxy('evil-internal.example', 443, np), false)
+})
+
+test('bypassProxy：帶埠的規則只管那個埠', () => {
+  const np = parseNoProxy({ NO_PROXY: 'api.example:8443' })
+  assert.equal(bypassProxy('api.example', 8443, np), true)
+  assert.equal(bypassProxy('api.example', 443, np), false)
+})
+
+test('connectVia：目標在 NO_PROXY 裡時直連，不經代理', async () => {
+  // 代理指的是一個不會有人監聽的埠；若真的走過去就會失敗
+  const proxy = { host: '127.0.0.1', port: 1, noProxy: parseNoProxy({ NO_PROXY: '127.0.0.1' }) }
+  const target = net.createServer((s) => s.end())
+  await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve))
+  const socket = await ready(target.address().port, '127.0.0.1', proxy)
+  socket.destroy()
+  await new Promise((resolve) => target.close(resolve))
 })
