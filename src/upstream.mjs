@@ -1,6 +1,4 @@
 import net from 'node:net'
-import http from 'node:http'
-import { Duplex } from 'node:stream'
 
 /**
  * 為上游連線建立「經代理」的 TCP 通道。
@@ -10,11 +8,13 @@ import { Duplex } from 'node:stream'
  * 部署在只允許經代理出網的機器上時（宿主用 nftables 把其他路徑全 DROP），
  * 這些連線會全部失敗；就算不被擋，也會以伺服器自己的真實 IP 出去。
  *
- * 作法是把目標主機交給上游代理，讓代理去連：對代理發一則
- * `CONNECT host:port`，收到 200 之後那條 socket 就是到目標的原始位元組通道。
- *
  * 代理取自 `HTTPS_PROXY`／`HTTP_PROXY`（大寫優先，與 curl 一致）。兩個都沒設時
  * 退回直連，行為與原版完全相同 —— 本機開發與 `npm test` 不受影響。
+ *
+ * 這裡刻意不偽裝 socket 的 `connect` 事件。同一條 socket 上，原生 `connect`
+ * （連上代理）與「隧道已通」是兩件事，而呼叫端無法分辨是哪一個；試過用包裝層
+ * 或改寫 emit 去掩蓋，都會在 pipe 與 tls.connect 上出問題。所以改成明確的
+ * callback：連線**到目標**之後才呼叫 `onReady`。
  */
 
 /** 從環境變數讀代理；沒有就回 null，呼叫端據此退回直連 */
@@ -31,93 +31,62 @@ export function proxyFromEnv(env = process.env) {
 }
 
 /**
- * 在 `raw` 之上包一層只轉發位元組的 Duplex。
- *
- * 為什麼要包而不是直接回傳原 socket：原生 socket 連上**代理**時會自己發一次
- * `connect`，而呼叫端（tunnel、relayUpgrade、以及它們的測試）都會在回傳值上掛
- * `connect` 監聽。若把原 socket 直接給出去，那個事件會被誤認為「隧道通了」，
- * 呼叫端於是提前寫出 `200 Connection Established`。包一層之後，外層物件只在
- * 代理回了 200 之後才發 `connect`，兩條路徑的事件順序才一致。
- *
- * @param {net.Socket} raw 到代理（或目標）的原始連線
- * @returns {Duplex}
- */
-function wrap(raw) {
-  const outer = new Duplex({
-    read() {},
-    write(chunk, encoding, callback) {
-      if (raw.destroyed) {
-        callback(new Error('upstream socket destroyed'))
-        return
-      }
-      raw.write(chunk, encoding, callback)
-    },
-    final(callback) {
-      raw.end()
-      callback()
-    },
-    destroy(error, callback) {
-      raw.destroy()
-      callback(error)
-    },
-  })
-  // 代理來的位元組原樣交給消費者；結束與錯誤也照傳
-  raw.on('data', (chunk) => {
-    if (!outer.push(chunk)) raw.pause()
-  })
-  raw.on('end', () => outer.push(null))
-  raw.on('error', (err) => outer.destroy(err))
-  raw.on('close', () => outer.destroy())
-  outer.on('drain', () => raw.resume())
-  return outer
-}
-
-/**
- * 開一條到 `host:port` 的 TCP 連線；設了代理就經代理，否則直連。
- *
- * 回傳的物件在代理路徑上會等 `CONNECT` 的 200 之後才對外發 `connect`，
- * 直連路徑則沿用原生行為。呼叫端不需要判斷走的是哪一條。
+ * 連到 `host:port`；設了代理就先對代理發 `CONNECT`，隧道建立後才回報。
  *
  * @param {number} port 目標埠
  * @param {string} host 目標主機
- * @param {{ host: string, port: number } | null} [proxy] 代理位址；null 表示直連
- * @returns {Duplex}
+ * @param {{ host: string, port: number } | null} proxy 代理位址；null 表示直連
+ * @param {(err: Error | null, socket: import('node:net').Socket | null) => void} onReady
+ *   成功時 `(null, socket)`，失敗時 `(err, null)`。socket 在成功之後完全歸呼叫端，
+ *   本函式不再碰它的事件。
+ * @returns {import('node:net').Socket} 底層 socket，呼叫端可在回報前就 destroy 它
  */
-export function connectVia(port, host, proxy) {
-  // 沒設代理：原版行為，直接連
-  if (!proxy) return net.connect(port, host)
+export function connectVia(port, host, proxy, onReady) {
+  // 沒設代理：原版行為，連上目標就算就緒
+  if (!proxy) {
+    const socket = net.connect(port, host)
+    // 用 once 而不是 on：這兩個只該各觸發一次。排到次輪事件循環才回報，
+    // 呼叫端（relayUpgrade）會在回報裡掛上 tls.connect；同步掛的話會在
+    // 本輪 emit 還沒走完時就開始讀 socket，實測會卡住握手。
+    socket.once('connect', () => setImmediate(() => onReady(null, socket)))
+    socket.once('error', (err) => setImmediate(() => onReady(err, null)))
+    return socket
+  }
 
+  const authority = net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`
   const socket = net.connect(proxy.port, proxy.host)
-  const outer = wrap(socket)
-  // 原生 connect 只代表連上代理，不對外透出
-  socket.on('connect', () => {
-    socket.write(
-      `CONNECT ${net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`} HTTP/1.1\r\n` +
-      `Host: ${net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`}\r\n\r\n`,
-    )
-  })
+  let handshake = ''
+  let done = false
 
-  let response = ''
+  // 這個監聽只吃到握手結束為止，之後呼叫端自己接管資料
   const onReply = (chunk) => {
-    response += chunk.toString('latin1')
+    handshake += chunk.toString('latin1')
     // 只需要狀態行與標頭；收到空行就算握手完成，之後的位元組屬於隧道內容
-    const end = response.indexOf('\r\n\r\n')
+    const end = handshake.indexOf('\r\n\r\n')
     if (end === -1) return
-    socket.pause()
+    done = true
     socket.removeListener('data', onReply)
 
-    const statusLine = response.slice(0, response.indexOf('\r\n'))
+    const statusLine = handshake.slice(0, handshake.indexOf('\r\n'))
     const code = Number(statusLine.split(' ')[1])
     if (code !== 200) {
-      outer.destroy(new Error(`proxy refused CONNECT ${host}:${port}: ${statusLine}`))
+      socket.destroy()
+      setImmediate(() => onReady(new Error(`proxy refused CONNECT ${authority}: ${statusLine}`), null))
       return
     }
-    // 標頭之後若已夾了位元組，先交給消費者，免得漏掉開頭
-    const rest = Buffer.from(response.slice(end + 4), 'latin1')
-    if (rest.length) outer.push(rest)
-    socket.resume()
-    outer.emit('connect')
+    // 標頭之後若已夾了位元組，塞回可讀緩衝，呼叫端才不會漏掉開頭
+    const rest = Buffer.from(handshake.slice(end + 4), 'latin1')
+    if (rest.length) socket.unshift(rest)
+    setImmediate(() => onReady(null, socket))
   }
+
+  socket.on('connect', () => socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`))
   socket.on('data', onReply)
-  return outer
+  // 還沒等到應答就斷線：回報錯誤，別讓呼叫端靜靜掛住
+  socket.on('close', () => {
+    if (done) return
+    done = true
+    setImmediate(() => onReady(new Error(`proxy closed before replying to CONNECT ${authority}`), null))
+  })
+  return socket
 }

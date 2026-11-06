@@ -55,23 +55,26 @@ function parseAuthority(authority) {
 const portOf = (url) => Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
 
 function tunnel(socket, head, host, port, egress) {
-  // 經代理（設了 HTTPS_PROXY 時）或直連；事件順序兩者相同，下面不必分支
-  const upstream = connectVia(port, host, egress)
   let established = false
-  upstream.on('connect', () => {
+  // onReady 在「到目標的通道真的通了」之後才被呼叫；經代理時那是收到 200 之後
+  const upstream = connectVia(port, host, egress, (err, upstreamSocket) => {
+    if (err) {
+      // 還沒回 200 就還能告訴 client 是上游連不上
+      socket.end('HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n')
+      return
+    }
     established = true
     socket.write(ESTABLISHED)
-    if (head.length) upstream.write(head)
-    upstream.pipe(socket)
-    socket.pipe(upstream)
+    if (head.length) upstreamSocket.write(head)
+    upstreamSocket.pipe(socket)
+    socket.pipe(upstreamSocket)
+    upstreamSocket.on('close', () => socket.destroy())
+    socket.on('close', () => upstreamSocket.destroy())
   })
-  upstream.on('error', () => {
-    // 還沒回 200 就還能告訴 client 是上游連不上；隧道開了之後只能斷線
-    if (established) socket.destroy()
-    else socket.end('HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n')
+  // 連線在 onReady 之前就失效時，socket 的 error 也只在這段期間有意義
+  socket.on('close', () => {
+    if (!established) upstream.destroy()
   })
-  upstream.on('close', () => socket.destroy())
-  socket.on('close', () => upstream.destroy())
 }
 
 /** 不緩衝、不改 body，逐塊雙向轉發 */
@@ -106,25 +109,28 @@ function relay(req, res, upstream) {
 function relayUpgrade(req, socket, head, upstream, egress) {
   socket.on('error', () => {})
   const secure = upstream.protocol === 'https:'
-  // 先建 TCP 通道（可能經代理），再決定是否在上面套 TLS
-  const raw = connectVia(portOf(upstream), upstream.hostname, egress)
-  const conn = secure
-    ? tls.connect({ socket: raw, servername: upstream.hostname })
-    : raw
-  conn.on(secure ? 'secureConnect' : 'connect', () => {
-    const lines = [`${req.method} ${req.url} HTTP/1.1`]
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      const name = req.rawHeaders[i]
-      lines.push(`${name}: ${name.toLowerCase() === 'host' ? upstream.host : req.rawHeaders[i + 1]}`)
+  // 先建 TCP 通道（可能經代理），等它真的到目標之後才在上面套 TLS
+  connectVia(portOf(upstream), upstream.hostname, egress, (err, raw) => {
+    if (err) {
+      socket.destroy()
+      return
     }
-    conn.write(`${lines.join('\r\n')}\r\n\r\n`)
-    if (head.length) conn.write(head)
-    conn.pipe(socket)
-    socket.pipe(conn)
+    const conn = secure ? tls.connect({ socket: raw, servername: upstream.hostname }) : raw
+    conn.on(secure ? 'secureConnect' : 'connect', () => {
+      const lines = [`${req.method} ${req.url} HTTP/1.1`]
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        const name = req.rawHeaders[i]
+        lines.push(`${name}: ${name.toLowerCase() === 'host' ? upstream.host : req.rawHeaders[i + 1]}`)
+      }
+      conn.write(`${lines.join('\r\n')}\r\n\r\n`)
+      if (head.length) conn.write(head)
+      conn.pipe(socket)
+      socket.pipe(conn)
+    })
+    conn.on('error', () => socket.destroy())
+    conn.on('close', () => socket.destroy())
+    socket.on('close', () => conn.destroy())
   })
-  conn.on('error', () => socket.destroy())
-  conn.on('close', () => socket.destroy())
-  socket.on('close', () => conn.destroy())
 }
 
 /**
