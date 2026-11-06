@@ -19,10 +19,14 @@ import net from 'node:net'
 
 /** 從環境變數讀代理；沒有就回 null，呼叫端據此退回直連 */
 export function proxyFromEnv(env = process.env) {
+  // 大寫優先，與 curl 的取用順序一致；有些工具只認小寫
   const raw = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy
+  // 沒設代理就是直連，呼叫端靠這個 null 判斷
   if (!raw) return null
+  // 解析失敗（例如只寫了主機名沒寫 scheme）也退回直連，不要讓它拋例外
   try {
     const url = new URL(raw)
+    // 沒寫埠時按 scheme 取預設值：https 代理 443、http 代理 80
     const port = Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
     return { host: url.hostname, port, noProxy: parseNoProxy(env) }
   } catch {
@@ -43,18 +47,22 @@ export function proxyFromEnv(env = process.env) {
 export function parseNoProxy(env = process.env) {
   const raw = env.NO_PROXY || env.no_proxy || ''
   const out = { all: false, rules: [] }
+  // 逐條拆開：逗號分隔，前後空白與大小寫都不影響比對
   for (const piece of raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)) {
-    // `*` 是「所有目的地都直連」
+    // `*` 是「所有目的地都直連」，不必再解析後面的
     if (piece === '*') {
       out.all = true
       continue
     }
-    // `host:port`：只在那個埠上繞過
+    // `host:port`：只在那個埠上繞過。用 lastIndexOf 是因為 IPv6 也含冒號，
+    // 但這裡的 NO_PROXY 只會出現主機名，取最後一個冒號即可
     const colon = piece.lastIndexOf(':')
     const hasPort = colon > 0 && /^\d+$/.test(piece.slice(colon + 1))
     const hostPart = hasPort ? piece.slice(0, colon) : piece
+    // 開頭帶點的寫法（`.example.com`）連子網域一起涵蓋
     const suffix = hostPart.startsWith('.')
     const host = suffix ? hostPart.slice(1) : hostPart
+    // 空規則（例如連續逗號）直接跳過，不然它會匹配所有空字串
     if (!host) continue
     out.rules.push({ suffix, host, port: hasPort ? Number(piece.slice(colon + 1)) : null })
   }
@@ -71,12 +79,14 @@ export function parseNoProxy(env = process.env) {
  * @returns {boolean}
  */
 export function bypassProxy(host, port, noProxy) {
+  // `*` 讓所有目的地都直連
   if (noProxy.all) return true
   const name = host.toLowerCase()
+  // 任一條規則命中就繞過；沒有一條命中才走代理
   return noProxy.rules.some((rule) => {
     // 帶埠的規則只管那個埠
     if (rule.port !== null && rule.port !== port) return false
-    // 後綴規則連子網域一起涵蓋
+    // 後綴規則連子網域一起涵蓋；不帶點的寫法要求主機名完全相符
     return rule.suffix ? name === rule.host || name.endsWith(`.${rule.host}`) : name === rule.host
   })
 }
@@ -121,6 +131,7 @@ export function connectVia(port, host, proxy, onReady) {
     socket.removeListener('data', onReply)
 
     const statusLine = handshake.slice(0, handshake.indexOf('\r\n'))
+    // 狀態行的第二段是三位數回應碼；非 200 一律當失敗
     const code = Number(statusLine.split(' ')[1])
     if (code !== 200) {
       socket.destroy()
@@ -133,9 +144,11 @@ export function connectVia(port, host, proxy, onReady) {
     setImmediate(() => onReady(null, socket))
   }
 
+  // 連上代理就發 CONNECT；回應由 onReply 吃，兩者可能同時到達，所以先掛監聽
   socket.on('connect', () => socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`))
   socket.on('data', onReply)
-  // 還沒等到應答就斷線：回報錯誤，別讓呼叫端靜靜掛住
+  // 還沒等到應答就斷線：回報錯誤，別讓呼叫端靜靜掛住。done 已設代表是
+  // 握手之後的正常關閉，那時該由呼叫端自己處理
   socket.on('close', () => {
     if (done) return
     done = true
