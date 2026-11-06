@@ -97,9 +97,10 @@ export function connectVia(port, host, proxy, onReady) {
   // 沒設代理，或目標在 NO_PROXY 裡：原版行為，直接連
   if (!proxy || bypassProxy(host, port, proxy.noProxy ?? { all: false, rules: [] })) {
     const socket = net.connect(port, host)
-    // 用 once 而不是 on：這兩個只該各觸發一次。排到次輪事件循環才回報，
-    // 呼叫端（relayUpgrade）會在回報裡掛上 tls.connect；同步掛的話會在
-    // 本輪 emit 還沒走完時就開始讀 socket。
+    // onReady 只回報「連上了或失敗了」這一個事實。呼叫端不能靠再等一次
+    // `connect` 事件：那時它已經發完了（下面代理分支同理，回報時機都是
+    // 事件過後）。排到次輪事件循環才回報，讓呼叫端在本輪 emit 走完之後
+    // 再掛自己的監聽。
     socket.once('connect', () => setImmediate(() => onReady(null, socket)))
     socket.once('error', (err) => setImmediate(() => onReady(err, null)))
     return socket

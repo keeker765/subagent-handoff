@@ -109,14 +109,15 @@ function relay(req, res, upstream) {
 function relayUpgrade(req, socket, head, upstream, egress) {
   socket.on('error', () => {})
   const secure = upstream.protocol === 'https:'
-  // 先建 TCP 通道（可能經代理），等它真的到目標之後才在上面套 TLS
+  // 先建 TCP 通道（可能經代理）。onReady 被呼叫時通道已經通了，
+  // 所以下面不需要再等一次 `connect` —— 那個事件在回報前就發完了。
   connectVia(portOf(upstream), upstream.hostname, egress, (err, raw) => {
     if (err) {
       socket.destroy()
       return
     }
     const conn = secure ? tls.connect({ socket: raw, servername: upstream.hostname }) : raw
-    conn.on(secure ? 'secureConnect' : 'connect', () => {
+    const handshake = () => {
       const lines = [`${req.method} ${req.url} HTTP/1.1`]
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         const name = req.rawHeaders[i]
@@ -126,7 +127,10 @@ function relayUpgrade(req, socket, head, upstream, egress) {
       if (head.length) conn.write(head)
       conn.pipe(socket)
       socket.pipe(conn)
-    })
+    }
+    // TLS 要等 secureConnect；明文通道在 onReady 時已經就緒，直接開始
+    if (secure) conn.once('secureConnect', handshake)
+    else handshake()
     conn.on('error', () => socket.destroy())
     conn.on('close', () => socket.destroy())
     socket.on('close', () => conn.destroy())
