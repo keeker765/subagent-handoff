@@ -5,6 +5,7 @@ import https from 'node:https'
 import { pipeline } from 'node:stream'
 import { PASSTHROUGH_BASE_URL } from './proxy.mjs'
 import { loadOrCreateCa, issueLeaf } from './ca.mjs'
+import { connectVia, proxyFromEnv } from './upstream.mjs'
 
 /**
  * HTTPS proxy 模式：讓 proxy 埠也接受 `CONNECT`，Claude Code 設 `HTTPS_PROXY` 就能接進來。
@@ -53,8 +54,9 @@ function parseAuthority(authority) {
 
 const portOf = (url) => Number(url.port) || (url.protocol === 'https:' ? 443 : 80)
 
-function tunnel(socket, head, host, port) {
-  const upstream = net.connect(port, host)
+function tunnel(socket, head, host, port, egress) {
+  // 經代理（設了 HTTPS_PROXY 時）或直連；事件順序兩者相同，下面不必分支
+  const upstream = connectVia(port, host, egress)
   let established = false
   upstream.on('connect', () => {
     established = true
@@ -101,12 +103,14 @@ function relay(req, res, upstream) {
  * Claude Code 的 voice mode 會對 `/api/ws/speech_to_text/voice_stream` 開 WebSocket（v2.1.281 執行檔內可見），
  * 沒接住的話開了 proxy 模式 voice mode 就壞。
  */
-function relayUpgrade(req, socket, head, upstream) {
+function relayUpgrade(req, socket, head, upstream, egress) {
   socket.on('error', () => {})
   const secure = upstream.protocol === 'https:'
+  // 先建 TCP 通道（可能經代理），再決定是否在上面套 TLS
+  const raw = connectVia(portOf(upstream), upstream.hostname, egress)
   const conn = secure
-    ? tls.connect({ host: upstream.hostname, port: portOf(upstream), servername: upstream.hostname })
-    : net.connect(portOf(upstream), upstream.hostname)
+    ? tls.connect({ socket: raw, servername: upstream.hostname })
+    : raw
   conn.on(secure ? 'secureConnect' : 'connect', () => {
     const lines = [`${req.method} ${req.url} HTTP/1.1`]
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
@@ -141,12 +145,15 @@ export function attachConnect(proxy, leaf, { upstreamBaseUrl = PASSTHROUGH_BASE_
   const secureContext = tls.createSecureContext({ key: leaf.keyPem, cert: leaf.certPem })
   const open = new Set()
   let detached = false
+  // 隧道與 WebSocket 的上游連線也走同一個代理：部署在只允許經代理出網的機器上時，
+  // net.connect 的直連會被宿主防火牆 DROP，這些請求就全部失效
+  const egress = proxyFromEnv()
 
   const decrypted = http.createServer((req, res) => {
     if (req.url.startsWith(ROUTED_PREFIX)) proxy.emit('request', req, res)
     else relay(req, res, upstream)
   })
-  decrypted.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream))
+  decrypted.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, egress))
   // 解開的請求由這一台解析 HTTP，逾時看的是它的設定，理由跟 src/index.mjs 裡 proxy 那台一樣：
   // Claude Code 會等串流等很久，兩輪對話之間的閒置也遠不只 Node 預設的 5 秒
   decrypted.headersTimeout = 0
@@ -167,7 +174,7 @@ export function attachConnect(proxy, leaf, { upstreamBaseUrl = PASSTHROUGH_BASE_
     }
 
     if (target.host !== INTERCEPT_HOST || target.port !== INTERCEPT_PORT) {
-      tunnel(socket, head, target.host, target.port)
+      tunnel(socket, head, target.host, target.port, egress)
       return
     }
 
